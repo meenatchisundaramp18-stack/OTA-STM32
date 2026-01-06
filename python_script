@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import time
+import struct
+import serial
+
+HEADER = b"\xAA\x55"
+END_MARKER = b"\x5A"
+CHUNK_SIZE = 512
+
+def flush_input(ser: serial.Serial) -> None:
+    try:
+        ser.reset_input_buffer()
+    except Exception:
+        pass
+
+def read_some(ser: serial.Serial, seconds: float) -> bytes:
+    """Read whatever arrives for 'seconds' and return it."""
+    end = time.time() + seconds
+    buf = bytearray()
+    while time.time() < end:
+        n = ser.in_waiting
+        if n:
+            buf += ser.read(n)
+        else:
+            time.sleep(0.01)
+    return bytes(buf)
+
+def read_until_any(ser: serial.Serial, patterns, overall_timeout=5.0) -> bytes:
+    start = time.time()
+    buf = bytearray()
+
+    while (time.time() - start) < overall_timeout:
+        b = ser.read(1)  # obeys ser.timeout [web:58][web:59]
+        if b:
+            buf += b
+            for p in patterns:
+                if p in buf:
+                    return bytes(buf)
+    raise TimeoutError(f"Timeout waiting for patterns: {patterns}. Last buffer={bytes(buf)!r}")
+
+def wait_for_text(ser: serial.Serial, text: bytes, overall_timeout=5.0) -> bytes:
+    return read_until_any(ser, [text], overall_timeout=overall_timeout)
+
+def open_serial_no_reset(port: str, baud: int, timeout: float) -> serial.Serial:
+    """
+    Try to reduce reset-on-open effects by setting DTR/RTS before opening.
+    (Some adapters/Windows drivers still toggle once on first open.) [web:78][web:80][web:58]
+    """
+    ser = serial.serial_for_url(port, do_not_open=True)
+    ser.baudrate = baud
+    ser.timeout = timeout
+    ser.write_timeout = 2.0
+
+    # Try to keep lines low before open
+    ser.dtr = False
+    ser.rts = False
+
+    ser.open()
+    return ser
+
+def sync_send_U_until_rdy_hdr(ser: serial.Serial, max_time=8.0) -> bytes:
+    """
+    Repeatedly send 'U' until RDY_HDR is observed.
+    This handles cases where the MCU resets right when the port opens.
+    """
+    start = time.time()
+    buf = bytearray()
+
+    while (time.time() - start) < max_time:
+        ser.write(b"U")
+        ser.flush()
+        # Read a short burst and see if RDY_HDR appears
+        try:
+            part = read_until_any(ser, [b"RDY_HDR"], overall_timeout=0.8)
+            buf += part
+            return bytes(buf)
+        except TimeoutError:
+            # collect any banner text too
+            buf += read_some(ser, 0.2)
+
+    raise TimeoutError(f"Could not sync (no RDY_HDR). Last buffer={bytes(buf)!r}")
+
+def main():
+    ap = argparse.ArgumentParser(description="STM32 UART Bootloader uploader (AA55 + size + data + ACK + 5A)")
+    ap.add_argument("-p", "--port", required=True, help="COM port (Windows: COM4, Linux: /dev/ttyUSB0)")
+    ap.add_argument("-b", "--baud", type=int, default=9600, help="Baud rate (default: 9600)")
+    ap.add_argument("-f", "--file", required=True, help="Firmware binary (.bin)")
+    ap.add_argument("--timeout", type=float, default=0.2, help="Per-read timeout seconds (default: 0.2)")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.file):
+        print(f"ERR: file not found: {args.file}", file=sys.stderr)
+        sys.exit(2)
+
+    fw = open(args.file, "rb").read()
+    fw_size = len(fw)
+
+    print(f"Firmware: {args.file}")
+    print(f"Size: {fw_size} bytes")
+
+    ser = open_serial_no_reset(args.port, args.baud, args.timeout)
+    try:
+        # Give MCU time if it reset on open
+        time.sleep(0.8)
+        banner = read_some(ser, 0.6)
+        if banner:
+            print("RX (banner/boot text):")
+            print(banner.decode(errors="ignore"))
+
+        # Important: clear old bytes then sync
+        flush_input(ser)
+
+        print("Sync: sending 'U' until RDY_HDR...")
+        sync_buf = sync_send_U_until_rdy_hdr(ser, max_time=10.0)
+        if sync_buf:
+            print("RX (sync):")
+            print(sync_buf.decode(errors="ignore"))
+
+        # Send header
+        print("Sending header AA55...")
+        ser.write(HEADER)
+        ser.flush()
+
+        print("Waiting for RDY_SIZE...")
+        wait_for_text(ser, b"RDY_SIZE", overall_timeout=5.0)
+
+        # Send size little-endian uint32
+        print("Sending size (uint32 LE)...")
+        ser.write(struct.pack("<I", fw_size))
+        ser.flush()
+
+        print("Waiting for RDY_DATA (erase may take time)...")
+        wait_for_text(ser, b"RDY_DATA", overall_timeout=25.0)
+
+        # Send chunks and wait ACK after each
+        sent = 0
+        total_chunks = (fw_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        for idx in range(total_chunks):
+            chunk = fw[sent:sent + CHUNK_SIZE]
+            ser.write(chunk)
+            ser.flush()
+            sent += len(chunk)
+
+            # Wait for ACK line
+            read_until_any(ser, [b"ACK\r\n", b"ACK\n", b"ACK"], overall_timeout=10.0)
+            print(f"Sent {sent}/{fw_size} bytes ({idx+1}/{total_chunks})")
+
+        print("Waiting for RDY_END...")
+        wait_for_text(ser, b"RDY_END", overall_timeout=5.0)
+
+        print("Sending END marker 0x5A...")
+        ser.write(END_MARKER)
+        ser.flush()
+
+        # Optional completion
+        try:
+            out = read_until_any(ser, [b"UPLOAD COMPLETE"], overall_timeout=5.0)
+            print("RX:", out.decode(errors="ignore").strip())
+        except TimeoutError:
+            print("End marker sent (no completion text captured).")
+
+        print("Upload finished.")
+    finally:
+        ser.close()
+
+if __name__ == "__main__":
+    main()
