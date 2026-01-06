@@ -29,8 +29,7 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum {
-  ST_WAIT_CMD = 0,
-  ST_WAIT_HDR1,
+  ST_WAIT_HDR1 = 0,
   ST_WAIT_HDR2,
   ST_WAIT_SIZE,
   ST_RECV_DATA,
@@ -43,21 +42,21 @@ typedef enum {
 #define LED_PIN                 GPIO_PIN_8
 #define LED_PORT                GPIOB
 
+#define BOOT_PIN                GPIO_PIN_0
+#define BOOT_PIN_PORT           GPIOB
+
 #define BOOTLOADER_START        0x08000000U
 #define BOOTLOADER_SIZE         0x0000C000U      // 48KB
 
-#define APP_START_ADDRESS       0x0800C000U      // Start of sector 3 on STM32F4 [web:149]
-#define APP_MAX_SIZE            (464U * 1024U)   // 512KB - 48KB = 464KB [web:130]
+#define APP_START_ADDRESS       0x0800C000U
+#define APP_MAX_SIZE            (464U * 1024U)
 
 #define CHUNK_SIZE              512U
+#define RX_DMA_BUF_SIZE         1024U
 
 #define HEADER_BYTE1            0xAA
 #define HEADER_BYTE2            0x55
 #define END_MARKER              0x5A
-
-#define BOOTLOADER_TIMEOUT_MS   5000U
-
-#define RX_DMA_BUF_SIZE         1024U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,20 +72,21 @@ DMA_HandleTypeDef hdma_usart1_rx;
 static uint8_t  rx_dma_buf[RX_DMA_BUF_SIZE];
 static volatile uint16_t rx_old_pos = 0;
 
-static bl_state_t bl_state = ST_WAIT_CMD;
+static bl_state_t bl_state = ST_WAIT_HDR1;
 
-static uint8_t size_bytes[4];
-static uint8_t size_idx = 0;
+static uint8_t  size_bytes[4];
+static uint8_t  size_idx = 0;
 
-static uint8_t chunk_buffer[CHUNK_SIZE];
+static uint8_t  chunk_buffer[CHUNK_SIZE];
 static uint16_t chunk_fill = 0;
 
 static uint32_t fw_size = 0;
 static uint32_t written = 0;
 
-static volatile uint8_t upload_done = 0;
+static volatile uint8_t upload_done  = 0;
 static volatile uint8_t upload_error = 0;
 static volatile uint8_t upload_active = 0;
+static volatile uint8_t force_upload_mode = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -102,6 +102,9 @@ static void BootRx_Start(void);
 static void BootRx_Check(void);
 static void BootRx_Process(const uint8_t *data, uint16_t len);
 static void BootRx_ResetUpload(void);
+
+static void Enter_Upload_Mode(void);
+static void Try_Jump_To_App_Or_Fallback(void);
 
 uint8_t Check_Application_Valid(void);
 uint8_t Flash_Erase_App_Sectors(void);
@@ -127,20 +130,49 @@ static void UART_Print(const char *s)
   HAL_UART_Transmit(&huart1, (uint8_t*)s, (uint16_t)strlen(s), 1000);
 }
 
-/* ----------- DMA Circular RX Start ----------- */
+static void BootRx_ResetUpload(void)
+{
+  fw_size = 0;
+  written = 0;
+  chunk_fill = 0;
+  size_idx = 0;
+
+  upload_done = 0;
+  upload_error = 0;
+
+  bl_state = ST_WAIT_HDR1;
+}
+
+/* Start circular DMA RX (WITH status + flag clear) */
 static void BootRx_Start(void)
 {
   rx_old_pos = 0;
 
-  HAL_UART_Receive_DMA(&huart1, rx_dma_buf, RX_DMA_BUF_SIZE);
+  // Clear UART error flags before enabling DMA RX
+  __HAL_UART_CLEAR_OREFLAG(&huart1);
+  __HAL_UART_CLEAR_FEFLAG(&huart1);
+  __HAL_UART_CLEAR_NEFLAG(&huart1);
+  __HAL_UART_CLEAR_PEFLAG(&huart1);
 
-  // Enable IDLE line interrupt (make sure USART1 IRQ enabled in NVIC)
+  HAL_StatusTypeDef st = HAL_UART_Receive_DMA(&huart1, rx_dma_buf, RX_DMA_BUF_SIZE);
+  if (st != HAL_OK)
+  {
+    UART_Print("ERR: HAL_UART_Receive_DMA failed\r\n");
+  }
+  else
+  {
+    UART_Print("DMA_RX_OK\r\n");
+  }
+
+  // IDLE interrupt optional (polling still works without it)
   __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
 }
 
-/* ----------- Check ring and process new bytes ----------- */
 static void BootRx_Check(void)
 {
+  if (huart1.hdmarx == NULL)
+    return;
+
   uint16_t pos = (uint16_t)(RX_DMA_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart1.hdmarx));
 
   if (pos != rx_old_pos)
@@ -158,16 +190,6 @@ static void BootRx_Check(void)
   }
 }
 
-static void BootRx_ResetUpload(void)
-{
-  fw_size = 0;
-  written = 0;
-  chunk_fill = 0;
-  size_idx = 0;
-  upload_done = 0;
-  upload_error = 0;
-}
-
 static void BootRx_Process(const uint8_t *data, uint16_t len)
 {
   for (uint16_t i = 0; i < len; i++)
@@ -176,29 +198,9 @@ static void BootRx_Process(const uint8_t *data, uint16_t len)
 
     switch (bl_state)
     {
-      case ST_WAIT_CMD:
-        if (b == 'U' || b == 'u')
-        {
-          UART_Print("\r\nUpload command received!\r\n");
-          UART_Print("Waiting for firmware data...\r\n\r\n");
-
-          BootRx_ResetUpload();
-          upload_active = 1;
-
-          UART_Print("RDY_HDR\r\n");
-          bl_state = ST_WAIT_HDR1;
-        }
-        break;
-
       case ST_WAIT_HDR1:
-        if (b == HEADER_BYTE1) bl_state = ST_WAIT_HDR2;
-        else
-        {
-          UART_Print("ERR: Invalid header\r\n");
-          upload_error = 1;
-          upload_active = 0;
-          bl_state = ST_WAIT_CMD;
-        }
+        if (b == HEADER_BYTE1)
+          bl_state = ST_WAIT_HDR2;
         break;
 
       case ST_WAIT_HDR2:
@@ -213,7 +215,8 @@ static void BootRx_Process(const uint8_t *data, uint16_t len)
           UART_Print("ERR: Invalid header\r\n");
           upload_error = 1;
           upload_active = 0;
-          bl_state = ST_WAIT_CMD;
+          BootRx_ResetUpload();
+          UART_Print("RDY_HDR\r\n");
         }
         break;
 
@@ -231,7 +234,8 @@ static void BootRx_Process(const uint8_t *data, uint16_t len)
             UART_Print("ERR: Invalid size\r\n");
             upload_error = 1;
             upload_active = 0;
-            bl_state = ST_WAIT_CMD;
+            BootRx_ResetUpload();
+            UART_Print("RDY_HDR\r\n");
             break;
           }
 
@@ -240,7 +244,8 @@ static void BootRx_Process(const uint8_t *data, uint16_t len)
             UART_Print("ERR: Erase failed\r\n");
             upload_error = 1;
             upload_active = 0;
-            bl_state = ST_WAIT_CMD;
+            BootRx_ResetUpload();
+            UART_Print("RDY_HDR\r\n");
             break;
           }
 
@@ -266,7 +271,8 @@ static void BootRx_Process(const uint8_t *data, uint16_t len)
               UART_Print("ERR: Flash write failed\r\n");
               upload_error = 1;
               upload_active = 0;
-              bl_state = ST_WAIT_CMD;
+              BootRx_ResetUpload();
+              UART_Print("RDY_HDR\r\n");
               break;
             }
 
@@ -288,39 +294,41 @@ static void BootRx_Process(const uint8_t *data, uint16_t len)
           UART_Print("\r\nUPLOAD COMPLETE!\r\n");
           upload_done = 1;
           upload_active = 0;
-          bl_state = ST_WAIT_CMD;
+
+          UART_Print("Stay in upload mode. Press RESET to run app.\r\n");
+          BootRx_ResetUpload();
+          UART_Print("RDY_HDR\r\n");
         }
         else
         {
           UART_Print("ERR: Invalid end marker\r\n");
           upload_error = 1;
           upload_active = 0;
-          bl_state = ST_WAIT_CMD;
+          BootRx_ResetUpload();
+          UART_Print("RDY_HDR\r\n");
         }
         break;
 
       default:
-        bl_state = ST_WAIT_CMD;
+        BootRx_ResetUpload();
+        UART_Print("RDY_HDR\r\n");
         break;
     }
   }
 }
+
 
 uint8_t Check_Application_Valid(void)
 {
   uint32_t sp = *(__IO uint32_t*)APP_START_ADDRESS;
   uint32_t pc = *(__IO uint32_t*)(APP_START_ADDRESS + 4);
 
-  // SRAM range for STM32F411: 128KB => 0x20000000..0x2001FFFF (your old check 0x20020000 is also OK)
   if (sp < 0x20000000U || sp > 0x20020000U) return 0;
-
-  // Reset handler must be within application flash region and Thumb bit must be 1
   if (pc < APP_START_ADDRESS || pc > (APP_START_ADDRESS + APP_MAX_SIZE) || (pc & 1U) == 0U) return 0;
 
   return 1;
 }
 
-/* IMPORTANT: app now starts at SECTOR 3 (0x0800C000) [web:149] */
 uint8_t Flash_Erase_App_Sectors(void)
 {
   FLASH_EraseInitTypeDef erase;
@@ -332,10 +340,8 @@ uint8_t Flash_Erase_App_Sectors(void)
 
   erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
   erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-
-  // App region: sectors 3..7 (sector 3 is 16KB at 0x0800C000) [web:149]
-  erase.Sector    = FLASH_SECTOR_3;
-  erase.NbSectors = 5;
+  erase.Sector       = FLASH_SECTOR_3;
+  erase.NbSectors    = 5;
 
   if (HAL_FLASHEx_Erase(&erase, &error) != HAL_OK)
   {
@@ -376,16 +382,23 @@ void Jump_To_Application(void)
   uint32_t pc = *(__IO uint32_t*)(APP_START_ADDRESS + 4);
 
   UART_Print("Jumping to application...\r\n");
-  HAL_Delay(200);
+  HAL_Delay(100);
 
-  // Minimal deinit
+  __disable_irq();
+  SysTick->CTRL = 0;
+  SysTick->LOAD = 0;
+  SysTick->VAL  = 0;
+
+  for (int i = 0; i < 8; i++)
+  {
+    NVIC->ICER[i] = 0xFFFFFFFF;
+    NVIC->ICPR[i] = 0xFFFFFFFF;
+  }
+
   HAL_UART_DeInit(&huart1);
-
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
 
-  // Set vector table to new app base
   SCB->VTOR = APP_START_ADDRESS;
-
   __set_MSP(sp);
 
   __DSB();
@@ -395,6 +408,35 @@ void Jump_To_Application(void)
   app_reset_handler();
 
   while (1);
+}
+
+static void Enter_Upload_Mode(void)
+{
+  MX_DMA_Init();
+  MX_USART1_UART_Init();
+
+  UART_Print("\r\n==========================================\r\n");
+  UART_Print("  UPLOAD MODE (PB0)\r\n");
+  UART_Print("  APP @ 0x0800C000\r\n");
+  UART_Print("==========================================\r\n");
+
+  BootRx_ResetUpload();
+  BootRx_Start();
+
+  upload_active = 1;
+  UART_Print("RDY_HDR\r\n");
+}
+
+static void Try_Jump_To_App_Or_Fallback(void)
+{
+  if (Check_Application_Valid())
+  {
+    Jump_To_Application();
+  }
+  else
+  {
+    Enter_Upload_Mode();
+  }
 }
 /* USER CODE END 0 */
 
@@ -430,20 +472,18 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_Delay(200);
-    LED_Blink(2, 120);
+  // PB0 pull-up, pressed => LOW
+    if (HAL_GPIO_ReadPin(BOOT_PIN_PORT, BOOT_PIN) == GPIO_PIN_RESET)
+      force_upload_mode = 1;
 
-    UART_Print("\r\n==========================================\r\n");
-    UART_Print("  STM32 UART BOOTLOADER (DMA CIRCULAR RX)\r\n");
-    UART_Print("  BL size: 48KB, APP @ 0x0800C000\r\n");
-    UART_Print("==========================================\r\n");
+    HAL_Delay(50);
+    LED_Blink(2, 80);
 
-    UART_Print("Press 'U' to upload firmware\r\n");
-    UART_Print("Or wait for auto-jump...\r\n\r\n");
+    if (force_upload_mode)
+      Enter_Upload_Mode();
+    else
+      Try_Jump_To_App_Or_Fallback();
 
-    BootRx_Start();
-
-    uint32_t start_time = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -453,49 +493,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  BootRx_Check();
-
-	     HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-	     HAL_Delay(150);
-
-	     if (!upload_active && (HAL_GetTick() - start_time) > BOOTLOADER_TIMEOUT_MS)
-	     {
-	       UART_Print("Timeout reached\r\nChecking for valid application...\r\n");
-
-	       if (Check_Application_Valid())
-	       {
-	         UART_Print("Valid application found\r\n");
-	         HAL_Delay(100);
-	         Jump_To_Application();
-	       }
-	       else
-	       {
-	         UART_Print("No valid application found\r\nStaying in bootloader mode\r\n\r\n");
-	         start_time = HAL_GetTick();
-	       }
-	     }
-
-	     if (upload_done)
-	     {
-	       UART_Print("Firmware upload successful!\r\n");
-	       HAL_Delay(100);
-
-	       if (Check_Application_Valid())
-	       {
-	         Jump_To_Application();
-	       }
-	       else
-	       {
-	         UART_Print("ERROR: Application verification failed!\r\n");
-	         upload_done = 0;
-	       }
-	     }
-
-	     if (upload_error)
-	     {
-	       UART_Print("Upload failed! Try again.\r\n");
-	       upload_error = 0;
-	     }
+	    // Upload mode loop (stays here until reset)
+	    BootRx_Check();
+	    HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+	    HAL_Delay(150);
   }
   /* USER CODE END 3 */
 }
@@ -603,11 +604,17 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PB8 */
   GPIO_InitStruct.Pin = GPIO_PIN_8;
